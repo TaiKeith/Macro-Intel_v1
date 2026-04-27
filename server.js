@@ -1,50 +1,34 @@
 import express from "express";
-import cors from "cors";
 import fetch from "node-fetch";
-import dotenv from "dotenv";
-
-dotenv.config();
+import cors from "cors";
 
 const app = express();
+app.use(cors());
+
 const PORT = 3001;
-const NEWS_KEY = process.env.VITE_NEWSAPI_KEY;
 
-app.use(cors({ origin: "http://localhost:5173" }));
-app.use(express.json());
-
-// ─────────────────────────────────────────────────────────
-// CACHE CONFIG (FASTER for near real-time actuals)
-// ─────────────────────────────────────────────────────────
-let calCache = [];
-let lastFetch = 0;
-const JSON_TTL = 60 * 1000; // 60s refresh (important!)
-
-
-// ─────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────
+/* =========================
+   NORMALIZATION (CRITICAL)
+========================= */
 function normalize(str) {
   return (str || "")
-    .toString()
-    .trim()
+    .toUpperCase()
     .replace(/\s+/g, " ")
-    .toUpperCase();
+    .trim();
 }
 
-function buildKey(e) {
-  return [
-    normalize(e.country),
-    normalize(e.title || e.name),
-    (e.date || "").slice(0, 10),
-    (e.time || "").trim()
-  ].join("|");
+/* =========================
+   KEY BUILDER (FIXED)
+   ❌ Removed time (unreliable)
+========================= */
+function makeKey(e) {
+  return `${normalize(e.country)}|${normalize(e.title)}|${e.date}`;
 }
 
-
-// ─────────────────────────────────────────────────────────
-// FETCH FOREX FACTORY JSON (WITH ACTUALS)
-// ─────────────────────────────────────────────────────────
-async function fetchFFCalendar() {
+/* =========================
+   FETCH FOREX FACTORY DATA
+========================= */
+async function fetchFFData() {
   const url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
 
   const res = await fetch(url, {
@@ -53,115 +37,90 @@ async function fetchFFCalendar() {
     }
   });
 
-  if (!res.ok) throw new Error(`FF JSON ${res.status}`);
-
   return await res.json();
 }
 
-
-// ─────────────────────────────────────────────────────────
-// BUILD CLEAN CALENDAR
-// ─────────────────────────────────────────────────────────
-function buildCalendar(events) {
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const tomorrowStr = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
-
-  return events
-    .filter(e => {
-      const d = (e.date || "").slice(0, 10);
-      return d === todayStr || d === tomorrowStr;
-    })
-    .map(e => {
-      const impact =
-        e.impact === "High" ? "3" :
-        e.impact === "Medium" ? "2" : "1";
-
-      return {
-        key: buildKey(e), // 🔑 strong key
-        country: e.country || "",
-        title: e.title || e.name || "",
-        date: (e.date || "").slice(0, 10),
-        time: e.time || "",
-        actual: e.actual || "",        // ✅ NOW COMES DIRECTLY
-        forecast: e.forecast || "",
-        previous: e.previous || "",
-        impact
-      };
-    })
-    .sort((a, b) => Number(b.impact) - Number(a.impact));
+/* =========================
+   BUILD EVENTS (Forecast + Previous)
+========================= */
+function buildEvents(data) {
+  return data.map(e => ({
+    key: makeKey(e),
+    country: e.country || "",
+    title: e.title || "",
+    date: e.date || "",
+    time: e.time || "",
+    actual: "", // will be filled later
+    forecast: e.forecast || "",
+    previous: e.previous || "",
+    impact: e.impact || ""
+  }));
 }
 
+/* =========================
+   EXTRACT ACTUALS
+========================= */
+function extractActuals(data) {
+  const actuals = {};
 
-// ─────────────────────────────────────────────────────────
-// CALENDAR ENDPOINT
-// ─────────────────────────────────────────────────────────
-app.get("/api/calendar", async (req, res) => {
-  const now = Date.now();
-  const force = req.query.force === "1";
-
-  try {
-    if (force || now - lastFetch > JSON_TTL || calCache.length === 0) {
-      console.log("[CAL] fetching FF JSON...");
-
-      const raw = await fetchFFCalendar();
-      calCache = buildCalendar(raw);
-
-      lastFetch = now;
-
-      const actualCount = calCache.filter(e => e.actual).length;
-      console.log(`[CAL] events: ${calCache.length}, actuals: ${actualCount}`);
+  data.forEach(e => {
+    if (e.actual) {
+      const key = makeKey(e);
+      actuals[key] = e.actual;
     }
+  });
+
+  return actuals;
+}
+
+/* =========================
+   MERGE ACTUALS
+========================= */
+function mergeActuals(events, actualsMap) {
+  return events.map(e => {
+    const key = makeKey(e);
+
+    return {
+      ...e,
+      actual: actualsMap[key] || ""
+    };
+  });
+}
+
+/* =========================
+   API ROUTE
+========================= */
+app.get("/api/calendar", async (req, res) => {
+  try {
+    const data = await fetchFFData();
+
+    const events = buildEvents(data);
+    const actualsMap = extractActuals(data);
+    const merged = mergeActuals(events, actualsMap);
+
+    // DEBUG (optional)
+    // merged.forEach(e => {
+    //   if (!e.actual && e.forecast) {
+    //     console.log("NO MATCH:", e.key);
+    //   }
+    // });
 
     res.json({
-      events: calCache,
-      refreshedAt: new Date(lastFetch).toISOString()
+      events: merged,
+      refreshedAt: new Date().toISOString()
     });
 
-  } catch (e) {
-    console.error("[CAL] error:", e.message);
-    res.status(500).json({ error: e.message, events: calCache });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      error: "Failed to fetch calendar"
+    });
   }
 });
 
-
-// ─────────────────────────────────────────────────────────
-// NEWS (UNCHANGED)
-// ─────────────────────────────────────────────────────────
-app.get("/api/news", async (req, res) => {
-  const { q = "markets economy", pageSize = 15 } = req.query;
-
-  try {
-    const url1 = `https://newsapi.org/v2/top-headlines?q=${encodeURIComponent(q)}&pageSize=${pageSize}&language=en&apiKey=${NEWS_KEY}`;
-    const r1 = await fetch(url1);
-    const data1 = await r1.json();
-
-    let articles = data1.articles || [];
-
-    if (articles.length < 8) {
-      const url2 = `https://newsapi.org/v2/everything?q=${encodeURIComponent(q)}&pageSize=${pageSize}&sortBy=publishedAt&language=en&apiKey=${NEWS_KEY}`;
-      const r2 = await fetch(url2);
-      const data2 = await r2.json();
-
-      if (r2.ok && data2.articles?.length) {
-        const seen = new Set(articles.map(a => a.title));
-        articles = [
-          ...articles,
-          ...data2.articles.filter(a => !seen.has(a.title))
-        ].slice(0, pageSize);
-      }
-    }
-
-    res.json({ articles });
-
-  } catch (e) {
-    console.error("[NEWS] error:", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
-// ─────────────────────────────────────────────────────────
+/* =========================
+   START SERVER
+========================= */
 app.listen(PORT, () => {
-  console.log(`\nMacroIntel → http://localhost:${PORT}`);
-  console.log(`Calendar → FF JSON (60s refresh, includes actuals)\n`);
+  console.log(`✅ Server running on http://localhost:${PORT}`);
 });
