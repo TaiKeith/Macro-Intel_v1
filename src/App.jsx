@@ -3,12 +3,12 @@ import { useState, useRef, useCallback, useEffect } from "react";
 const PROXY = "http://localhost:3001";
 
 const CATEGORIES = [
-  { id: "all",           label: "ALL",          icon: "◈", query: "global markets economy geopolitics central bank forex gold NAS100" },
-  { id: "macro",         label: "MACRO",         icon: "📊", query: "GDP inflation CPI PPI employment NFP trade balance economic data" },
-  { id: "geopolitics",   label: "GEO·POL",       icon: "🌐", query: "geopolitical tensions war sanctions trade war political risk elections" },
-  { id: "central_banks", label: "CENTRAL BANKS", icon: "🏦", query: "Federal Reserve ECB Bank of England BOJ interest rates monetary policy FOMC" },
-  { id: "commodities",   label: "COMMODITIES",   icon: "⚡", query: "oil crude gold silver copper natural gas commodity prices OPEC" },
-  { id: "crypto",        label: "CRYPTO",        icon: "₿",  query: "Bitcoin Ethereum crypto regulation DeFi blockchain institutional" },
+  { id: "all",           label: "ALL",          icon: "◈", query: "markets economy" },
+  { id: "macro",         label: "MACRO",         icon: "📊", query: "inflation GDP employment" },
+  { id: "geopolitics",   label: "GEO·POL",       icon: "🌐", query: "geopolitics trade war sanctions" },
+  { id: "central_banks", label: "CENTRAL BANKS", icon: "🏦", query: "Federal Reserve interest rates" },
+  { id: "commodities",   label: "COMMODITIES",   icon: "⚡", query: "oil gold commodities" },
+  { id: "crypto",        label: "CRYPTO",        icon: "₿",  query: "Bitcoin crypto" },
 ];
 
 const SENTIMENT_CONFIG = {
@@ -70,14 +70,23 @@ async function fetchCalendar(signal) {
   return data.events || [];
 }
 
-async function callGemini(apiKey, prompt, signal) {
+async function callGemini(apiKey, prompt, signal, useSearch = false) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 8192,
+      // Force JSON only when NOT using search (search grounding incompatible with responseMimeType)
+      ...(useSearch ? {} : { responseMimeType: "application/json" }),
+    },
+  };
+  if (useSearch) {
+    body.tools = [{ googleSearch: {} }];
+  }
   const res = await fetch(url, {
     method: "POST", headers: { "Content-Type": "application/json" }, signal,
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -87,28 +96,44 @@ async function callGemini(apiKey, prompt, signal) {
     throw new Error(msg);
   }
   const data = await res.json();
-  return (data?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("\n");
+  const text = (data?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("\n");
+  console.log("[GEMINI] response length:", text.length, "| first 200 chars:", text.slice(0,200));
+  return text;
 }
 
-// Dedicated Gemini call to interpret a single calendar event that just released
+// Dedicated Gemini call to interpret a single calendar event — uses web search to find actual value
 async function interpretEvent(apiKey, ev) {
-  const beat = ev.actual && ev.forecast
-    ? parseFloat(String(ev.actual).replace(/[^0-9.-]/g,"")) > parseFloat(String(ev.forecast).replace(/[^0-9.-]/g,""))
-    : null;
-  const prompt = `You are a senior FX trader. A key economic event just released. Interpret it in plain trading language.
+  const hasActual = ev.actual && ev.actual.trim() !== "";
+  
+  const today = new Date().toLocaleDateString("en-US", {month:"long", day:"numeric", year:"numeric"});
+  const prompt = `You are a senior FX macro analyst. Today is ${today}.
 
-EVENT: ${ev.country} ${ev.title}
-Actual:   ${ev.actual}
-Forecast: ${ev.forecast || "N/A"}
-Previous: ${ev.previous || "N/A"}
-Beat/Miss: ${beat === true ? "BEAT (came in above forecast)" : beat === false ? "MISS (came in below forecast)" : "IN LINE or no forecast"}
+Use Google Search to find the ACTUAL RELEASED VALUE for this economic event. Search specifically for the event name and country.
+
+EVENT DETAILS:
+Country:   ${ev.country}
+Indicator: ${ev.title}
+Date:      ${ev.date}
+Time:      ${ev.time} UTC
+Forecast:  ${ev.forecast || "N/A"}
+Previous:  ${ev.previous || "N/A"}
+${hasActual ? `Our Data Shows: ${ev.actual}` : `Our data feed does not have the actual yet. SEARCH FOR IT NOW.`}
+
+SEARCH INSTRUCTIONS:
+1. Search: "${ev.title} ${ev.country} ${ev.date} actual"
+2. Also try: "${ev.country} ${ev.title} released today"
+3. If the event released today or recently, the actual value WILL be available online
+4. If truly not released yet, set verdict to "NOT YET RELEASED"
+
+Once you have the actual value, compare vs forecast and interpret for forex traders.
 
 Return ONLY a JSON object (no markdown):
 {
-  "verdict": "BEAT|MISS|IN LINE|NO FORECAST",
+  "actualValue": "the actual number you found e.g. 3.2% or 48.3 — string",
+  "verdict": "BEAT|MISS|IN LINE|NO FORECAST|NOT YET RELEASED",
   "dollarImpact": "UP|DOWN|NEUTRAL",
-  "summary": "1 plain-english sentence: what happened e.g. US CPI came in hot at 3.2% vs 3.1% forecast",
-  "meaning": "2 sentences explaining what this means for markets in simple terms — avoid jargon",
+  "summary": "1 plain-english sentence: what happened e.g. German GfK Consumer Climate came in at -20.6 vs -25.0 forecast — a beat",
+  "meaning": "2 sentences explaining what this means for markets in simple terms",
   "pairImpacts": {
     "DXY":    { "direction": "UP|DOWN|NEUTRAL", "reason": "one sentence" },
     "EURUSD": { "direction": "UP|DOWN|NEUTRAL", "reason": "one sentence" },
@@ -122,7 +147,7 @@ Return ONLY a JSON object (no markdown):
   "traderNote": "1 actionable sentence for a forex/gold/NAS100 day trader right now"
 }`;
 
-  const res = await callGemini(apiKey, prompt, null);
+  const res = await callGemini(apiKey, prompt, null, true); // useSearch=true to find actuals
   try {
     const clean = res.replace(/```json|```/gi,"").trim();
     const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
@@ -133,15 +158,23 @@ Return ONLY a JSON object (no markdown):
 function parseJSON(text) {
   const clean = text.replace(/```json|```/gi, "").trim();
   const s = clean.indexOf("["), e = clean.lastIndexOf("]");
-  if (s === -1 || e === -1) return [];
-  try { return JSON.parse(clean.slice(s, e+1)); } catch { return []; }
+  if (s === -1 || e === -1) {
+    console.error("[PARSE] No JSON array found in response. Full text:", text.slice(0, 500));
+    return [];
+  }
+  try {
+    return JSON.parse(clean.slice(s, e+1));
+  } catch(err) {
+    console.error("[PARSE] JSON parse failed:", err.message, "| snippet:", clean.slice(s, s+300));
+    return [];
+  }
 }
 
 function buildPrompt(articles, calendarEvents, category) {
   const now = new Date().toUTCString();
   const articleText = articles.length > 0
     ? articles.map((a,i) => `[${i+1}] ${a.source} | ${new Date(a.publishedAt).toLocaleString()}\n    TITLE: ${a.title}\n    DESC: ${a.description||"N/A"}`).join("\n\n")
-    : "No articles available.";
+    : "No live articles available — use your own knowledge of current macro conditions, recent central bank decisions, geopolitical events, and market themes to generate realistic and relevant signals.";
   const calText = calendarEvents.length > 0
     ? calendarEvents.map(e => `• [${e.impact==="3"?"HIGH":e.impact==="2"?"MEDIUM":"LOW"}] ${e.country} | ${e.title||e.event} | ${e.date||""} ${e.time||""} | Actual: ${e.actual||"pending"} | Forecast: ${e.forecast||"N/A"} | Prev: ${e.previous||"N/A"}`).join("\n")
     : "No calendar data available.";
@@ -159,9 +192,11 @@ ${calText}
 
 FOCUS: ${category.toUpperCase()}
 
-Return ONLY a raw JSON array. Start with [ end with ]. No markdown.
+YOUR RESPONSE MUST BE PURE JSON. Start your entire response with [ and end with ]. 
+Do NOT include any text, explanation, or markdown before or after the JSON array.
+Do NOT wrap in code fences. Just the raw JSON array.
 
-5 signal objects + 1 summary object.
+5 signal objects + 1 summary object:
 
 SIGNAL:
 {
@@ -632,7 +667,7 @@ export default function MarketIntelDashboard() {
             const isAnalyzing=analyzingEvent===key;
 
             return(
-              <div key={i} className="cal-row" onClick={()=>{ setSelectedEvent(ev); if(hasActual&&!analysis&&!isAnalyzing) analyseEvent(ev); }}
+              <div key={i} className="cal-row" onClick={()=>{ setSelectedEvent(ev); if(!analysis&&!isAnalyzing) analyseEvent(ev); }}
                 style={{ padding:"8px 12px", borderBottom:`1px solid #07111a`, borderLeft:`2px solid ${ic.color}${isUpcoming||isLive?"ff":"55"}`, background:isLive?"rgba(255,69,96,0.05)":isUpcoming?"rgba(255,140,0,0.04)":"transparent" }}>
 
                 {/* Upcoming / Live alert badge */}
@@ -651,7 +686,7 @@ export default function MarketIntelDashboard() {
 
                 <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:3 }}>
                   {[
-                    ["ACT",actual,hasActual?(beat===true?"#00ff9d":beat===false?"#ff4560":"#ffc107"):T4],
+                    ["ACT", analysis?.actualValue||actual||"—", analysis?.actualValue?(analysis.verdict==="BEAT"?"#00ff9d":analysis.verdict==="MISS"?"#ff4560":"#ffc107"):(hasActual?(beat===true?"#00ff9d":beat===false?"#ff4560":"#ffc107"):T4)],
                     ["FORE",forecast,"#4a8aa0"],
                     ["PREV",previous,T3],
                   ].map(([label,val,color])=>(
@@ -659,8 +694,8 @@ export default function MarketIntelDashboard() {
                       <div style={{ fontSize:6, color:T4, letterSpacing:1, marginBottom:1 }}>{label}</div>
                       <div style={{ fontSize:8, color, fontWeight:label==="ACT"&&hasActual?700:400 }}>
                         {String(val||"—")}
-                        {label==="ACT"&&beat===true&&" ▲"}
-                        {label==="ACT"&&beat===false&&" ▼"}
+                        {label==="ACT"&&(analysis?.verdict==="BEAT"||beat===true)&&" ▲"}
+                        {label==="ACT"&&(analysis?.verdict==="MISS"||beat===false)&&" ▼"}
                       </div>
                     </div>
                   ))}
@@ -676,7 +711,7 @@ export default function MarketIntelDashboard() {
                   </div>
                 )}
                 {isAnalyzing&&<div style={{ marginTop:5, fontSize:7, color:"#00d4ff" }} className="pulse">ANALYSING...</div>}
-                {hasActual&&!analysis&&!isAnalyzing&&<div style={{ marginTop:4, fontSize:7, color:T4 }}>↗ tap to analyse</div>}
+                {!analysis&&!isAnalyzing&&<div style={{ marginTop:4, fontSize:7, color:T4 }}>↗ tap for analysis</div>}
               </div>
             );
           })}
@@ -721,7 +756,7 @@ export default function MarketIntelDashboard() {
               {/* Actual / Forecast / Previous big display */}
               <div style={{ padding:"14px 16px", borderBottom:`1px solid ${BDR}`, display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
                 {[
-                  ["ACTUAL",actual,hasActual?(beat===true?"#00ff9d":beat===false?"#ff4560":"#ffc107"):T4],
+                  ["ACTUAL", analysis?.actualValue||actual||"—", analysis?.actualValue||(beat===true?"#00ff9d":beat===false?"#ff4560":"#ffc107")],
                   ["FORECAST",forecast,"#4a8aa0"],
                   ["PREVIOUS",previous,T3],
                 ].map(([label,val,color])=>(
@@ -744,9 +779,13 @@ export default function MarketIntelDashboard() {
                   </div>
                 )}
 
-                {!hasActual&&!isAnalyzing&&(
-                  <div style={{ textAlign:"center", padding:"20px", fontSize:9, color:T4 }}>
-                    AWAITING ACTUAL RELEASE
+                {!hasActual&&!isAnalyzing&&!analysis&&(
+                  <div style={{ textAlign:"center", padding:"20px" }}>
+                    <div style={{ fontSize:9, color:T3, marginBottom:12 }}>ACTUAL NOT IN FEED — GEMINI WILL SEARCH FOR IT</div>
+                    <button className="scan-btn" onClick={()=>analyseEvent(selectedEvent)}
+                      style={{ padding:"7px 18px", fontSize:9, letterSpacing:2, color:"#00d4ff", border:"1px solid #00d4ff44", background:"transparent" }}>
+                      ⟳ SEARCH &amp; ANALYSE
+                    </button>
                   </div>
                 )}
 
